@@ -5,7 +5,7 @@ Mutato is a software package for detecting somatic mutations and germline varian
 Features
 --------
 - Simultaneous variant calling across multiple BAM files
-- High performance (analyzes xxx,xxx gigabytes of BAM format alignments / hour / thread)
+- High performance (analyzes 25 gigabytes of BAM alignments / hour / thread)
 - Implemented entirely in the Rust language (no unsafe code)
 - Self-contained binary, no external dependencies
 

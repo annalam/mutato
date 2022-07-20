@@ -28,10 +28,6 @@ mutato call --alt-reads=5 --alt-frac=0.05 --min-mapq=0 hg38.fa *.bam > variants.
 
 The first positional parameter `hg38.fa` is a reference genome FASTA file, followed by a list of BAM files to analyze. The BAM files must be position-sorted, and must have been aligned against the provided reference genome.  All samples of interest (including tumor samples, matched germline samples, and negative control samples) should be included in the same run. Mutato will detect all candidate variants that carry a non-reference allele with read level evidence surpassing the user-specified thresholds `--alt-reads` and `--alt-frac`. The generated output file is a tab-delimited matrix describing the read-level evidence for each candidate variant in each input BAM file.
 
-The analysis can be parallelized across chromosomes by utilizing the `--region` flag:
-```
-mutato call --region=chr1 --alt-reads=5 --alt-frac=0.05 --min-mapq=0 hg38.fa *.bam > variants.vcf
-```
 
 
 Future work

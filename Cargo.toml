@@ -1,10 +1,13 @@
 [package]
 name = "mutato"
-version = "0.7.0"
-authors = ["Matti Annala <matti.annala@tuni.fi>", "Anssi Nurminen <anssi.nurminen@tuni.fi"]
+version = "0.8.0"
+edition = "2021"
+authors = ["Matti Annala <matti.annala@tuni.fi>", "Anssi Nurminen <anssi.nurminen@tuni.fi", "Joonatan Sipola <joonatan.sipola@tuni.fi"]
 
 [dependencies]
 docopt = "1"
 bio = "0.31"
 rust-htslib = "0.31"
-lazy_static = "1"
+itertools = "0.10"
+smartstring = "1"
+rayon = "1"

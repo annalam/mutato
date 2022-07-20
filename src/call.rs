@@ -1,584 +1,517 @@
-use parse_args;
+use std::cmp::min;
 use std::str;
-use std::cmp::{min, max};
-use std::io::{Write, BufReader, BufRead, stderr};
-use std::process::exit;
 use std::collections::VecDeque;
-use std::path::Path;
+use rust_htslib::bam::{self, Read, record::Cigar};
+use itertools::Itertools;
+use rayon::prelude::*;
+use smartstring::alias::String;    // Small string optimization
+use crate::{parse_args, common::Genome};
 
-use rust_htslib::bam;
-use rust_htslib::bam::Read;
-use rust_htslib::bam::record::{Cigar, Record};
-
-use genome_reader::RefGenomeReader;
-use reader_of_bams::ReaderOfBams;
-
-const MAX_READ_LEN: usize = 5000;
-const WINDOW_LEN: usize = 50000;
 const USAGE: &str = "
 Usage:
   mutato call [options] <genome.fa> <bam_files>...
 
 Options:
-  --region=REGION     Genomic region to include in analysis [default: all]
-  --alt-reads=N       Minimum alt allele reads to report [default: 0]
-  --alt-frac=N        Minimum alt allele fraction to report [default: 0.0]
-  --min-mapq=N        Ignore reads with mapping quality < N [default: 0]
-  --min-baseq=N       Ignore bases with a base quality < N [default: 0]
-  --min-end-dist=N    Ignore N bases at both read ends [default: 0]
-  --count-duplicates  Count reads that are marked as duplicates
-  --max-frag-len=N    Ignore DNA fragments longer than N bases [default: Inf]
+  --alt-reads=N     Minimum alt allele reads to report [default: 5]
+  --alt-frac=N      Minimum alt allele fraction to report [default: 0.1]
+  --no-strand-bias  Do not report strand bias statistics
+  --threads=N       Maximum number of threads to use [default: 4]
+
+Analyzes a set of BAM samples provided by the user to identify potential
+genomic variants. The analysis is carried out in two passes. In the first pass,
+the algorithm searches for genomic positions where at least one of the BAM
+samples carries a non-reference allele with the number of supporting reads
+exceeding user-specified thresholds. In the second pass, the algorithm
+calculates the precise number of (non-duplicate) reads supporting each
+candidate variant in each BAM file, and outputs this information as a
+tab-separated file reminiscent of the VCF format.
+
+The software also reports the following additional statistics for each
+candidate variant:
+- Average mapping quality (MAPQ) of reads supporting the variant allele
+- Average distance of the variant allele from the nearest read end
+- Percentage of variant allele reads aligned to the + strand of the genome
+- Percentage of non-variant allele reads aligned to the + strand of the genome
+
+By including negative control samples in the analysis, an empirical background
+error rate can be established for each variant, and used for filtering.
 ";
 
-
-// Information from the reads are collected into "pileups" for each
-// genomic coordinate. The pileups are processed for windows of the
-// genome.
 
 #[derive(Copy, Clone)]
 struct Substitution {
 	reads: u32,
-	sidedness: u32, // Average distance from nearest read end
-	mapq: u32
+	sidedness: u32,     // Average position from nearest read end
+	mapq: u32,
+	strand: u32         // Number of supporting reads in + strand
 }
 
 impl Substitution {
 	pub fn new() -> Substitution {
-		Substitution { reads: 0, sidedness: 0, mapq: 0 }
+		Substitution { reads: 0, sidedness: 0, mapq: 0, strand: 0 }
 	}
 }
 
 #[derive(Clone)]
 struct Indel {
-	sequence: Box<str>,    // Prefixed with '+' for insertion, '-' for deletion
+	sequence: String,   // Prefixed with '+' for insertion, '-' for deletion
 	reads: u32,
-	sidedness: u32,
-	mapq: u32
+	sidedness: u32,     // Average position from nearest read end
+	mapq: u32,
+	strand: u32
 }
 
-// TODO: We could merge Substitution and Indel into one Mutation type with
-// a 64-bit field that specifies the alternate allele. Then we could have
-// Pileup simply be a SmallVec with room for 1 or 2 Mutations objects.
 #[derive(Clone)]
 struct Pileup {
 	total: u32,
 	acgt: [Substitution; 4],
-	indels: Vec<Indel>
+	indels: Vec<Indel>,
+	strand: u32       // Total number of overlapping reads in + strand
 }
 
-struct Settings {
-	min_baseq: usize,
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
+struct Mutation {
+	chr: u16,
+	position: u32,
+	alt_allele: String
 }
 
-fn reset_pileups( pileups : &mut Vec<VecDeque<Pileup>>, n_files : usize, buffer_len : usize )
-{
-		pileups.clear();
-		// Generate new pileup vectors
-		for b in 0..n_files {
-			pileups.push( VecDeque::with_capacity( buffer_len));
-			fill_pileup( &mut pileups[ b], buffer_len);
-		}
-}
-
-fn fill_pileup( pileup : &mut VecDeque<Pileup>, buffer_len : usize ){
-
-	for _k in 0..(buffer_len - pileup.len()) {
-		pileup.push_back( Pileup { total: 0, acgt: [
-						Substitution::new(), Substitution::new(),
-						Substitution::new(), Substitution::new()
-						], indels: Vec::new() });
-	}
+#[derive(Clone)]
+struct Evidence {
+	alt_reads: u32,
+	total_reads: u32,
+	mapq: u8,
+	sidedness: u8,
+	strand: u8,           // Percent of alt allele reads in + strand (0..100)
+	other_strand: u8      // Percent of other reads in + strand (0..100)
 }
 
 pub fn main() {
-
-	let args = parse_args( USAGE);
+	let args = parse_args(USAGE);
 	let genome_path = args.get_str("<genome.fa>");
 	let bam_paths = args.get_vec("<bam_files>");
 	let alt_reads: u32 = args.get_str("--alt-reads").parse().unwrap_or_else(
 		|_| error!("--alt-reads must be a positive integer"));
 	let alt_frac: f32 = args.get_str("--alt-frac").parse().unwrap_or_else(
 		|_| error!("--alt-frac must be a fraction between 0 and 1."));
-	let min_mapq: u8 = args.get_str("--min-mapq").parse().unwrap_or_else(
-		|_| error!("--min-mapq must be a non-negative integer."));
-	let min_baseq: u8 = args.get_str("--min-baseq").parse().unwrap_or_else(
-		|_| error!("--min-baseq must be a non-negative integer."));
-	let min_end_distance: u8 = args.get_str("--min-end-dist").parse()
-		.unwrap_or_else(|_| error!("--min-end-dist must be a non-negative number."));
-	let count_duplicates = args.get_bool("--count-duplicates");
-	let max_frag_len: usize = if args.get_str("--max-frag-len") == "Inf" {
-		0
-	} else {
-		args.get_str("--max-frag-len").parse().unwrap()
-	};
-	let genome_region = args.get_str("--region");
+	//let min_baseq: u8 = args.get_str("--min-baseq").parse().unwrap_or_else(
+	//	|_| error!("--min-baseq must be a non-negative integer."));
+	let max_threads: usize = args.get_str("--threads").parse().unwrap_or_else(
+		|_| error!("--threads must be a positive integer."));
+	let no_strand_bias: bool = args.get_bool("--no-strand-bias");
 
-	// Read the reference genome FASTA index into memory.
-	let mut ref_genome_reader = RefGenomeReader::new(genome_path);	
+	eprintln!("Reading reference genome into memory...");
+	let genome = Genome::from_fasta(&genome_path);
 
-	let n_bams = bam_paths.len();
-	let mut pileups: Vec<VecDeque<Pileup>> = Vec::with_capacity(n_bams);
+	// Initialize the thread pool for analyzing multiple BAM files in parallel
+	rayon::ThreadPoolBuilder::new().num_threads(max_threads).build_global()
+		.unwrap();
 
-	let mut bam_reader = ReaderOfBams::new(n_bams);
+	eprintln!("Analyzing BAM files for candidate variants:");
+	let variants: Vec<_> = bam_paths.par_iter().map(|&bam_path| {
+		eprintln!("- {}", &bam_path);
+		let mut variants = analyze_bam_firstpass(&bam_path, &genome,
+			alt_reads, alt_frac);
+		variants.sort();  // Sort in preparation for k-way merge
+		variants
+	}).collect();
 
-	// Set up bam file reader that makes sure
-	// all input bam files are congruent (consistent names and lengths)
-	// ReaderOfBams uses indexed reader if index files are available
-	// If index files are not available it iterates through all
-	// records
-	for b in 0..n_bams { bam_reader.add_file( &bam_paths[ b]); }
+	eprintln!("Merging per-sample lists of candidate variants...");
+	let variants: Vec<Mutation> = itertools::kmerge(variants).dedup().collect();
 
-	//if bam_reader.chr_names.contains( String::from( &genome_region)) { region_is_valid = true; }
-	let region_is_valid = bam_reader.index_for_name(genome_region).is_ok();
-	let mut next_chr = 0i32;
+	eprintln!("Found {} candidate variants.", variants.len());
 
-	if !region_is_valid && genome_region != "" && genome_region != "all" {
-		error!("Invalid genomic region '{}' specified.", genome_region);
-	} else if genome_region != "" && genome_region != "all" {
-		next_chr = bam_reader.index_for_name(genome_region)
-			.unwrap_or_else(|_| error!("Cannot find index for region '{}'", genome_region)) as i32;
-	}
+	eprintln!("Calculating evidence matrix...");
+	let evidence: Vec<_> = bam_paths.par_iter().map(|&bam_path| {
+		analyze_bam_secondpass(&bam_path, &genome, &variants)
+	}).collect();
 
-	// Output header row.
+	eprintln!("Analysis complete.");
+
 	print!("CHROM\tPOSITION\tREF\tALT\tNOTES");
 	for bam_path in &bam_paths {
-		// Remove bam-suffix and possible filepath
-		let path = Path::new( bam_path);
-		print!("\t{}", path.file_stem().unwrap().to_str().unwrap());
+		print!("\t{}", bam_path.trim_end_matches(".bam"));
 	}
 	println!();
+	for k in 0..variants.len() {
+		let chr = variants[k].chr;
+		let pos = variants[k].position as usize;
+		print!("{}\t{}\t", &genome.name(chr as usize), pos);
 
-	let buffer_len = WINDOW_LEN + MAX_READ_LEN;
+		let ref_base = genome.sequence_by_chr_idx(chr as usize)[pos - 1] as char;
 
-	let mut skip_from_chr = -1i32; 	
-
-	let mut loaded_ref_chr = -1;
-	let mut chr_seq = Vec::new();
-
-	// Loop through all regions
-	'chr_loop: for chr_index in 0..bam_reader.chr_names.len() {
-		
-		let chr_index_i32 = chr_index as i32;
-		// Skipping chromosomes
-		if next_chr >= 0 && next_chr > chr_index_i32 { 
-			if skip_from_chr == -1 { skip_from_chr = chr_index_i32; }
-			continue; 
+		if variants[k].alt_allele.len() == 1 {
+			print!("{}\t{}\t", ref_base, &variants[k].alt_allele);
+		} else if variants[k].alt_allele.starts_with('+') {
+			print!("{}\t{}{}\t", ref_base, ref_base,
+				&variants[k].alt_allele[1..]);
+		} else if variants[k].alt_allele.starts_with('-') {
+			let del_len = variants[k].alt_allele.len() - 1;
+			print!("{}\t{}\t", str::from_utf8(&genome.sequence_by_chr_idx(chr as usize)[pos-1..pos+del_len]).unwrap(), ref_base);
+		} else {
+			unreachable!();
 		}
 
-		// Print skipping info when skipped
-		if skip_from_chr >= 0 { skip_from_chr = -1; }
-		next_chr = -1;
-		
-		// Skipping a region will cause the records to be read and discarded
-		// Genomic regions (chromosomes) are skipped if the --region flag is
-		// used
-		let skip_region = if genome_region == "" || genome_region == "all" { false
-		} else if genome_region == bam_reader.chr_names[chr_index]  {
-			false
-		} else { true };
-
-	    // If we are skipping a region after the region has already been
-	    // found we are done!	   
-		if skip_region { 
-			eprintln!( "INFO: Region {} processed. Exitting...", &genome_region);
-			break 'chr_loop; 
-		}		
-		
-		// Reset the pileup vectors, because we are in a new chromosome.
-		reset_pileups( &mut pileups, n_bams, buffer_len);	
-
-		// These two variables keep track of the current pileup window
-		// Inside the current reference chromosome (region)
-		let mut window_start;
-		let mut window_end: usize = 0;	
-		//let mut window_next = 0usize;	
-
-		let mut last_window = false; // Switching region (chromosome) after this window		
-		let region_len = bam_reader.chr_lens[ chr_index]; 
-		let mut read_reach: usize = 0;
-		
-		// Loop while reads inside the read window
-		// TODO: Use for-loop with .step_by() here when stable
-		'window_loop: loop {  	
-
-			// Move window to next position
-			window_start = window_end;
-			window_end = window_start + WINDOW_LEN;
-
-			if window_start > bam_reader.chr_lens[ chr_index] {
-				error!("Window set beyond region '{}' length {} at {}.",bam_reader.chr_names[ chr_index], region_len, window_start);
-			} else if window_end >= bam_reader.chr_lens[ chr_index] { last_window = true;
-			} // if window reaches beyond end of chr, it is the last window
-
-			// DEBUG window tracking
-			//eprintln!( "WINDOW: {} {}-{} ({:.2}%) {}",
-			//	bam_reader.chr_names[ chr_index],
-			//	window_start, window_end,
-			//	(window_start as f32 / (region_len+1)as f32) * 100.0,
-			//	if last_window {&"LAST"} else {&""}  );
-			
-			// Go through the window in every input BAM file.
-			'bam_loop: for bam_index in 0..n_bams {
-			
-				// Append enough empty Pileup structures into the (drained) buffer,
-				// so we do not try to write past its boundaries.
-				fill_pileup( &mut pileups[ bam_index], buffer_len);
-
-				'reads_loop: loop {
-
-					// read_next_record returns false if there are no more reads
-					// for the specified region and window
-					// Use window end +1 to be able to assign indels at the window 
-					// border to the previous genomic coordinate
-					if bam_reader.read_next_record( bam_index, chr_index_i32, window_start, window_end+1 ) == false {
-						// No more records for the requested window
-						// Move on to next bam file
-						break 'reads_loop; 
-					}		
-
-					//New record (read) was loaded
-					let ref read = bam_reader.record.as_ref()
-						.unwrap_or_else(|| error!("Record not set."));
-
-					let pos = read.pos() as usize;    // 0-based position	
-					let tid = read.tid();  // chr index, -1 if none
-
-					// Sanity checks
-					if pos < window_start && tid == chr_index_i32 { 
-						eprintln!("Window set to: {}:{} {}-{}",bam_reader.chr_names[ chr_index], chr_index, window_start, window_end);
-						error!("Reads in BAM file '{}' are not sorted by position. ({}:{}-{})", bam_paths[ bam_index], tid, pos, window_start); 
-					} else if tid != chr_index_i32 {
-						error!("Reader returned record from incorrect region. chr:{} vs. read:{}", tid, chr_index); 
-					}
-
-					// Check if the read needs to be processed
-					if read.is_unmapped() { continue; }
-					if read.is_secondary() { continue; }
-					if read.is_supplementary() { continue; }
-					if read.is_quality_check_failed() { continue; }
-
-					// User can choose to count reads that
-					// have been flagged as PCR/optical duplicates.
-					if read.is_duplicate() && !count_duplicates { continue; }
-
-					if read.mapq() < min_mapq { continue; }
-
-					// If the user only wants to count concordant reads, check
-					// that the mates have aligned to the same chromosome and
-					// are not too far apart.
-					if max_frag_len > 0 {
-						if read.tid() != read.mtid() { continue; }
-						if read.insert_size().abs() > max_frag_len as i64 {
-							continue;
-						}
-					}
-
-					// Load required reference sequence for the read,
-					// if not already loaded
-					if loaded_ref_chr != tid { 
-						chr_seq = ref_genome_reader.load_chromosome_seq( &bam_reader.chr_names[ chr_index]); 
-						loaded_ref_chr = tid;
-					}														
-								
-					// Process read CIGAR and add its information to pileups
-					let seq = read.seq();
-					let cigar = read.cigar();
-					let qual = read.qual();
-					let read_length = seq.len();
-					if read_length > MAX_READ_LEN {
-						eprintln!("WARNING: Read {} is {} bases long, exceeding the maximum length threshold of {}.", str::from_utf8(read.qname()).unwrap(), seq.len(), MAX_READ_LEN);
-						continue;
-					}
-
-					read_reach = max(read_reach, pos + read_length);
-
-					// These variables keep track of our current position
-					// within the pileup track and the read sequence, as we
-					// read through the CIGAR string.
-					let mut pileup_idx = pos - window_start;
-					let mut seq_idx = 0;
-					let mut prior_n = false;
-
-					// Handle all CIGAR elements in order
-					'cigar_loop: for s in cigar.iter() { match *s {
-
-						Cigar::Match(len) | Cigar::Equal(len) | Cigar::Diff(len) => {
-							for _ in 0..len {
-								let acgt_idx = encoded_base_to_acgt_index( seq.encoded_base(seq_idx));
-								if acgt_idx >= 4 {
-									prior_n = true;  // Ambiguous base
-								} else if qual[seq_idx] < min_baseq {
-									prior_n = true;  // Low quality base, ignore
-								} else {
-									let mut pileup = &mut pileups[ bam_index][ pileup_idx];
-									let mut acgt = &mut pileup.acgt[ acgt_idx];
-
-									prior_n = false;
-									
-									// Distance from nearest read end
-									let end_distance = min(seq_idx, seq.len() - 1 - seq_idx) as u32;
-
-									if end_distance >= min_end_distance as u32 {
-										pileup.total += 1;
-										acgt.reads += 1;
-
-										// Running totals, division later
-										acgt.sidedness += end_distance;
-										acgt.mapq += read.mapq() as u32;
-									}
-								}
-								pileup_idx += 1;
-								seq_idx += 1;
-							}
-						},
-						Cigar::Ins(len) => {
-
-							if pileup_idx == 0 || seq_idx == 0 { 
-								eprintln!("WARNING: Insertion at index 0 ignored.");
-								seq_idx += len as usize;
-								continue;
-							}
-					
-							let mut allele = String::with_capacity(len as usize + 2);
-							allele.push('+'); //Mark insertions with a plus
-							allele.push((chr_seq[window_start + pileup_idx-1] as char).to_ascii_uppercase());
-
-							for l in 0..len {
-								allele.push(encoded_base_to_char( seq.encoded_base( seq_idx)));
-								//base_qual_avg = (base_qual_avg * (l as f32) + (qual[ seq_idx] as f32)) / (l+1) as f32;
-								seq_idx += 1 as usize;
-							}
-
-							// Discard insertions with any Ns
-							if allele.contains("N") { continue; } 
-
-							// Distance from nearest read end
-							let end_distance = min(seq_idx-(len as usize), (seq.len()-1)-seq_idx) as u32;
-							if end_distance < min_end_distance as u32 {
-								continue;
-							}
-
-							let pileup = &mut pileups[ bam_index][ pileup_idx-1];
-
-							count_indel( pileup, &allele, end_distance, read.mapq());
-							// Indels are assigned to the coordinate of the previous MATCHing base
-							// If the previous MATCHing base was an N, it has not been added to 
-							// pile.total and needs to be added here
-							if prior_n { pileup.total += 1; }
-						},
-						Cigar::Del(len) => {
-							if pileup_idx == 0 { 
-								eprintln!("WARNING: Deletion at index 0 ignored.");
-								pileup_idx += len as usize;
-								continue;
-							}
-							let mut pileup = &mut pileups[ bam_index][ pileup_idx-1];							
-							let mut allele = String::with_capacity( len as usize + 2);
-							allele.push('-');
-							allele.push( (chr_seq[ window_start + pileup_idx-1] as char).to_ascii_uppercase());
-
-							for _ in 0..len {
-								allele.push( (chr_seq[ window_start + pileup_idx] as char).to_ascii_uppercase());
-								pileup_idx += 1;
-							}
-
-							// No N in ref genome
-							// if allele.contains("N") { continue; }
-
-							// Distance from nearest read end
-							let end_distance = min(seq_idx, seq.len() - 1 -seq_idx) as u32;
-							if end_distance < min_end_distance as u32 {
-								continue;
-							}
-
-							count_indel( &mut pileup, &allele, end_distance, read.mapq());
-							// Indels are assigned to the coordinate of the previous MATCHing base
-							// If the previous MATCHing base was an N, it has not been added to 
-							// pile.total and needs to be added here								
-							if prior_n { pileup.total += 1; }
-						},
-						Cigar::SoftClip(_len) | Cigar::HardClip(_len) => {
-							// Soft and hard clips must be the last item
-							// in a CIGAR string. So if we see them,
-							// we are done with the read.
-							break 'cigar_loop;
-						},
-						Cigar::RefSkip(_len) =>
-							error!("Unexpected CIGAR type: N"),
-						Cigar::Pad(_len) =>
-							error!("Unexpected CIGAR type: P")
-					}} //for each cigar
-				} // for each read
-			} //for each bam
-		
-			// Process pileups if there are any reads within the window.	
-			// If no reads begin or extend into the current window,
-			// pileups are empty
-			if read_reach > window_start { 
-				assert!(loaded_ref_chr >= 0);
-
-				// Pileups have been filled for the window + buffer
-				// Output variations that are above specified tresholds
-				process_pileups( &pileups, chr_index, window_start, 0, WINDOW_LEN, &chr_seq, alt_frac, alt_reads, &bam_reader );
-				
-				// Pileups will be reset after the last window
-				// and do not need to be drained
-				if !last_window {
-					for b in 0..n_bams {
-						// Drain (delete) one window's worth of positions from the buffer
-						pileups[b].drain(0..WINDOW_LEN);
-					}
-				}
-			}		
-
-			// After last window in the region, 
-			// move on to next region
-			if last_window { break 'window_loop; }
-
-		} // Window inside chromosome
-	} // For each chromosome
-}
-
-// Print pileups for genomic positions where at least one sample
-// has sufficient evidence of variation
-// NOTE: start_ind and end_ind are relative to window_begin
-fn process_pileups( pileups : &Vec<VecDeque<Pileup>>, chr_index : usize, window_begin : usize, start_ind : usize, end_ind : usize, ref_seq : &Vec<u8>,
-                    alt_frac : f32, alt_reads : u32, bam_reader : &ReaderOfBams )  {
-
-	let n_bams = pileups.len();
-	let region_len = bam_reader.chr_lens[ chr_index];
-	if start_ind >= end_ind { return; } 
-
-	for k in start_ind..end_ind {
-	
-		let seq_idx = window_begin + k;
-	
-		// Stop if we have reached the end of the region (chromosome).
-		if seq_idx == region_len { break; }
-	
-		//let curpos = window_start + k;
-		//if curpos % 1000000 == 0 { eprintln!( "POS: {} {}", &chr_names[ chr_index], curpos); }
-		let ref_base = (ref_seq[ seq_idx] as char).to_ascii_uppercase();
-	
-		// Build a list of indels that need to be reported
-		let mut report_indels: Vec<Box<str>> = Vec::new();
-		for bam_index in 0..n_bams {
-			
-			let ref pileup = &pileups[ bam_index][ k];
-	
-			for i in 0..pileup.indels.len() {  
-	
-				let mut indel = &pileup.indels[ i];
-				if (indel.reads as f32) / (pileup.total as f32) < alt_frac || indel.reads < alt_reads {
-					continue; 
-				}
-	
-				if report_indels.contains( &indel.sequence) == false {
-					report_indels.push( indel.sequence.clone());
+		for s in 0..bam_paths.len() {
+			let e = &evidence[s][k];
+			print!("\t{}:{}", e.alt_reads, e.total_reads);
+			if e.alt_reads == 0 {
+				print!(":0::0");
+			} else {
+				if no_strand_bias {
+					print!(":{}::{}", e.mapq, e.sidedness);
+				} else {
+					print!(":{}:{},{}:{}", e.mapq, e.strand, e.other_strand, e.sidedness);
 				}
 			}
 		}
-	
-		// Print the indels. Note that indels must be printed before
-		// base substitutions, since their position will be pos-1, and
-		// we want position-sorted output rows.
-		for indel_seq in report_indels {
-			let sign = indel_seq.chars().next().unwrap();
-	
-			if sign == '+' {
-				print!("{}\t{}\t{}\t{}\t", bam_reader.chr_names[ chr_index], seq_idx+1, ref_base, &indel_seq[1..]);
-			} else if sign == '-' {
-				print!("{}\t{}\t{}\t{}\t", bam_reader.chr_names[ chr_index], seq_idx+1, &indel_seq[1..], ref_base);
-			}
-			else {
-				error!("Unknown indel type.");
-			}
-	
-			'outer: for j in 0..n_bams {
-				let pile = pileups[ j].get( k).unwrap();
-				for indel in &pile.indels {
-					if indel.sequence == indel_seq {
-						// Output indel stats
-						let avg_mapq = if indel.reads == 0 { 0.0 } else {
-							(indel.mapq as f32) / (indel.reads as f32)
-						};
-						let avg_sidedness = if indel.reads == 0 { 0.0 } else {
-							(indel.sidedness as f32) / (indel.reads as f32)
-						};
-						print!("\t{}:{}:{:.0}::{:.0}", indel.reads, pile.total,
-							avg_mapq, avg_sidedness);
-						if (indel.reads as f32) / (pile.total as f32) >= alt_frac && indel.reads >= alt_reads {
-							print!(":*");
-						}
-						continue 'outer;
-					}
-				}
-				print!("\t0:{}:0::0", pile.total);
-			}
-			println!();
-		}
-				
-		// Print base substitutions that are above thresholds.
-		const ACGT: [char; 4] = ['A', 'C', 'G', 'T'];
-		for base in 0..4 {
-			if ref_base == ACGT[ base] { continue; }
-	
-			// Any sample above thresholds?
-			let mut variation_found = false;
-			for bam_index in 0..n_bams {
-				let ref pile = &pileups[ bam_index][ k];
-				let reads = pile.acgt[ base].reads;
-				if reads >= alt_reads && (reads as f32) / (pile.total as f32) >= alt_frac { 
-					variation_found = true;
-					break; 
-				}
-			}
-	
-			if !variation_found { continue; }
-	
-			print!("{}\t{}\t{}\t{}\t", bam_reader.chr_names[ chr_index], seq_idx+1, ref_base, ACGT[ base]);
-			for bam_index in 0..n_bams {
-				let ref pile = &pileups[ bam_index][ k];
-				let ref acgt = &pile.acgt[ base];
-				let reads = acgt.reads;						
-
-				// Output mismatch statistics
-				let avg_mapq = if reads == 0 { 0.0 } else {
-					(acgt.mapq as f32) / (reads as f32)
-				};
-				let avg_sidedness = if reads == 0 { 0.0 } else {
-					(acgt.sidedness as f32) / (reads as f32)
-				};
-				print!("\t{}:{}:{:.0}::{:.0}", reads, pile.total, avg_mapq, avg_sidedness);
-
-				let vaf = (reads as f32) / (pile.total as f32);
-				if vaf >= alt_frac && reads >= alt_reads { print!(":*"); }
-			}
-			println!();					
-		}		
+		println!();
 	}
 }
 
 
-fn count_indel(pileup: &mut Pileup, seq: &str, end_distance: u32, mapq: u8) {
+fn analyze_bam_firstpass(bam_path: &str, genome: &Genome, alt_reads: u32, alt_frac: f32) -> Vec<Mutation> {
+
+	// Open the BAM file for reading
+	let mut bam = bam::Reader::from_path(bam_path).unwrap_or_else(
+		|_| error!("Could not open BAM file '{}'.", &bam_path));
+	let header = bam.header().clone();
+	let chr_names: Vec<&str> = header.target_names().iter().map(|x| str::from_utf8(x).unwrap()).collect();
+
+	let mut pileups: VecDeque<Pileup> = VecDeque::with_capacity(1000);
+	let mut curr_chr: u32 = u32::MAX;
+	let mut curr_pos: u32 = 0;
+	let mut chr_seq = genome.sequence_by_chr_idx(0);
+	let mut mutations: Vec<Mutation> = Vec::new();
+
+	let mut read = bam::Record::new();
+	while read_bam_record(&mut bam, &mut read) {
+		if read.is_unmapped() || read.is_duplicate() { continue; }
+		if read.is_secondary() || read.is_supplementary() { continue; }
+		if read.is_quality_check_failed() { continue; }
+		if read.tid() < 0 { error!("Invalid TID < 0."); }
+
+		let chr = read.tid() as u32;
+		let pos = read.pos() as u32 + 1;   // Convert to one-based coordinate
+
+		// Check how many pileups we have finalized (i.e. will no longer change)
+		let to_report = if chr != curr_chr {
+			pileups.len()
+		} else if pos > curr_pos {
+			min((pos - curr_pos) as usize, pileups.len())
+		} else if pos < curr_pos {
+			error!("BAM file must be sorted by position.");
+		} else {
+			0
+		};
+
+		// Go through the finalized pileups, and check if any meet our
+		// thresholds.
+		for pileup in pileups.drain(0..to_report) {
+			let ref_base = chr_seq[curr_pos as usize - 1];
+			let chr_idx = genome.chr_idx(&chr_names[curr_chr as usize]).unwrap() as u16;
+
+			const ACGT: [u8; 4] = [b'A', b'C', b'G', b'T'];
+			for base in 0..4 {
+				if ref_base == ACGT[base] { continue; }
+				let reads = pileup.acgt[base].reads;
+				if reads < alt_reads || (reads as f32) / (pileup.total as f32) < alt_frac {
+					continue;
+				}
+				mutations.push(Mutation { chr: chr_idx, position: curr_pos,
+					alt_allele: str::from_utf8(&[ACGT[base]]).unwrap().into() });
+			}
+
+			for indel in pileup.indels {
+				if indel.reads < alt_reads ||
+					(indel.reads as f32) / (pileup.total as f32) < alt_frac {
+					continue;
+				}
+				let sign = indel.sequence.as_bytes()[0];
+				mutations.push(Mutation { chr: chr_idx, position: curr_pos,
+					alt_allele: indel.sequence.into() });
+			}
+
+			curr_pos += 1;
+		}
+
+		// It is critical that these are updated only *after* reporting
+		// the pileups.
+		if chr != curr_chr {
+			chr_seq = genome.sequence(chr_names[chr as usize]).unwrap_or_else(||
+				error!("BAM file {} refers to chromosome {}, but no such region is found in the genome FASTA file.", &bam_path,
+					&chr_names[chr as usize]));
+		}
+		curr_chr = chr;
+		curr_pos = pos;
+
+		// At this point pileups[0] represents chromosome position "curr_pos".
+		// We add the read to the pileups vector.
+		add_read_to_pileups(&mut pileups, &read);
+	}
+
+	mutations
+}
+
+
+
+fn analyze_bam_secondpass(bam_path: &str, genome: &Genome, mutations: &Vec<Mutation>) -> Vec<Evidence> {
+
+	// Open the BAM file for reading
+	let mut bam = bam::Reader::from_path(bam_path).unwrap_or_else(
+		|_| error!("Could not open BAM file '{}'.", &bam_path));
+	let header = bam.header().clone();
+
+	// For each chromosome listed in the BAM header, calculate its index
+	// within the Genome data structure.
+	let chr_indices: Vec<u16> = header.target_names().iter().map(|x| genome.chr_idx(&str::from_utf8(x).unwrap()).unwrap() as u16).collect();
+
+	let mut pileups: VecDeque<Pileup> = VecDeque::with_capacity(1000);
+	let mut curr_chr: u32 = u32::MAX;
+	let mut curr_pos: u32 = 0;
+	let mut chr_seq = genome.sequence_by_chr_idx(0);
+	let mut chr_muts: VecDeque<usize> = VecDeque::new();
+	let mut evidence = vec![Evidence { alt_reads: 0, total_reads: 0, mapq: 0, sidedness: 0, strand: 0, other_strand: 0 }; mutations.len()];
+
+	let mut read = bam::Record::new();
+	while read_bam_record(&mut bam, &mut read) {
+		if read.is_unmapped() || read.is_duplicate() { continue; }
+		if read.is_secondary() || read.is_supplementary() { continue; }
+		if read.is_quality_check_failed() { continue; }
+		if read.tid() < 0 { error!("Invalid TID < 0."); }
+
+		let chr = read.tid() as u32;
+		let pos = read.pos() as u32 + 1;   // Convert to 1-based coordinate
+
+		// Check how many pileups we have finalized (i.e. will no longer change)
+		let to_report = if chr != curr_chr {
+			pileups.len()
+		} else if pos > curr_pos {
+			min((pos - curr_pos) as usize, pileups.len())
+		} else if pos < curr_pos {
+			error!("BAM file must be sorted by position.");
+		} else {
+			0
+		};
+
+		// Go through the finalized pileups, and check if the user requested
+		// any of them to be reported out.
+		while !chr_muts.is_empty() &&
+			mutations[chr_muts[0]].position < curr_pos {
+			chr_muts.pop_front();
+		}
+		for pileup in pileups.drain(0..to_report) {
+			while !chr_muts.is_empty() &&
+				mutations[chr_muts[0]].position == curr_pos {
+
+				// This genomic position contained a candidate variant in the
+				// first-pass analysis, so we store the number of supporting
+				// reads in the matrix.
+				let mutation = &mutations[chr_muts[0]];
+				evidence[chr_muts[0]] = if mutation.alt_allele.len() == 1 {
+					// Base substitution
+					let base = base_to_acgt_index(mutation.alt_allele.as_bytes()[0]);
+					let sub = &pileup.acgt[base];
+					Evidence {
+						alt_reads: sub.reads, total_reads: pileup.total,
+						mapq: (sub.mapq as f32 / sub.reads as f32).round() as u8,
+						sidedness: (sub.sidedness as f32 / sub.reads as f32).round() as u8,
+						strand: (sub.strand as f32 / sub.reads as f32 * 100.0).round() as u8,
+						other_strand: ((pileup.strand - sub.strand) as f32 / (pileup.total - sub.reads) as f32 * 100.0).round() as u8
+					}
+				} else if let Some(indel) = pileup.indels.iter()
+					.find(|i| i.sequence == mutation.alt_allele) {
+					Evidence {
+						alt_reads: indel.reads, total_reads: pileup.total,
+						mapq: (indel.mapq as f32 / indel.reads as f32).round() as u8,
+						sidedness: (indel.sidedness as f32 / indel.reads as f32).round() as u8,
+						strand: (indel.strand as f32 / indel.reads as f32 * 100.0).round() as u8,
+						other_strand: ((pileup.strand - indel.strand) as f32 / (pileup.total - indel.reads) as f32 * 100.0).round() as u8
+					}
+				} else {
+					Evidence { alt_reads: 0, total_reads: pileup.total,
+						mapq: 0, sidedness: 0, strand: 0, other_strand: 0 }
+				};
+
+				chr_muts.pop_front();
+			}
+			curr_pos += 1;
+		}
+
+		// If we have moved to a new chromosome, we generate a new vector
+		// containing the indices of that chromosome's mutation candidates,
+		// sorted in ascending order of chromosomal position.
+		if chr != curr_chr {
+			let mut inside: Vec<_> = (0..mutations.len()).filter(|&m| mutations[m].chr == chr_indices[chr as usize]).collect();
+			inside.sort_by_key(|&m| mutations[m].position);
+			chr_muts = inside.into();   // Convert from Vec to VecDeque
+
+			chr_seq = genome.sequence_by_chr_idx(chr_indices[chr as usize] as usize);
+		}
+
+		// It is critical that these are updated only *after* reporting
+		// the pileups.
+		curr_chr = chr;
+		curr_pos = pos;
+
+		// At this point pileups[0] represents chromosome position "curr_pos".
+		// We add the read to the pileups vector.
+		add_read_to_pileups(&mut pileups, &read);
+	}
+
+	evidence
+}
+
+
+
+fn add_read_to_pileups(pileups: &mut VecDeque<Pileup>, read: &bam::Record) {
+	// Calculate how long the pileup vector needs to be to accommodate
+	// the information from this read.
+	let mut read_span = 0;
+	for s in read.cigar().iter() {
+		match *s {
+			Cigar::Match(len) | Cigar::Equal(len) | Cigar::Diff(len) |
+			Cigar::Del(len) | Cigar::RefSkip(len) => {
+				read_span += len as usize;
+			},
+			Cigar::Ins(_) | Cigar::SoftClip(_) | Cigar::HardClip(_) => {},
+			_ => error!("Unsupported CIGAR element found.")
+		}
+	}
+
+	// Extend the pileup vector if necessary.
+	while pileups.len() < read_span {
+		pileups.push_back(Pileup {
+			acgt: [Substitution { reads: 0, mapq: 0, sidedness: 0, strand: 0 }; 4],
+			total: 0, indels: Vec::new(), strand: 0 });
+	}
+
+	// These variables keep track of our current position
+	// within the pileup track and the read sequence, as we
+	// read through the CIGAR string.
+	let mut pileup_idx = 0;
+	let mut seq_idx = 0;
+	let mut prior_n = false;
+
+	let seq = read.seq();
+	let qual = read.qual();
+
+	for s in read.cigar().iter() {
+		match *s {
+			Cigar::Match(len) | Cigar::Equal(len) | Cigar::Diff(len) => {
+				for _ in 0..len {
+					let acgt_idx = encoded_base_to_acgt_index(seq.encoded_base(seq_idx));
+					if acgt_idx >= 4 {
+						prior_n = true;  // Ambiguous nucleotide
+					//} else if qual[seq_idx] < min_baseq {
+					//	prior_n = true;  // Low quality base, ignore
+					} else {
+						let mut pileup = &mut pileups[pileup_idx];
+						let mut sub = &mut pileup.acgt[acgt_idx];
+
+						prior_n = false;
+						pileup.total += 1;
+						pileup.strand += if read.is_reverse() { 0 } else { 1 };
+
+						sub.reads += 1;
+						sub.sidedness += min(seq_idx,
+							seq.len() - 1 - seq_idx) as u32;
+						sub.mapq += read.mapq() as u32;
+						sub.strand += if read.is_reverse() { 0 } else { 1 };
+					}
+					pileup_idx += 1;
+					seq_idx += 1;
+				}
+			},
+			Cigar::Ins(len) => {
+				if pileup_idx == 0 {
+					error!("CIGAR strings starting with insertion are not supported.");
+				}
+
+				let mut allele = String::new();
+				allele.push('+');     // Mark insertions with a plus
+				for _ in 0..len {
+					allele.push(encoded_base_to_char(seq.encoded_base(seq_idx)));
+					seq_idx += 1;
+				}
+				if allele.contains('N') { continue; }  // No ambiguous
+
+				// Distance from nearest read end
+				let sidedness = min(seq_idx - (len as usize),
+					seq.len() - 1 - seq_idx);
+
+				let pileup = &mut pileups[pileup_idx - 1];
+				count_indel(pileup, &allele, sidedness, read.mapq(),
+					!read.is_reverse());
+
+				// Indel read counts are stored in the pileup structure that
+				// is located immediately to the left of where the indel begins.
+				// If that base was N in this read, it was not counted towards
+				// pileup.total and so we do so here.
+				if prior_n {
+					pileup.total += 1;
+					pileup.strand += if read.is_reverse() { 0 } else { 1 };
+				}
+			},
+			Cigar::Del(len) => {
+				if pileup_idx == 0 { 
+					error!("CIGAR strings starting with deletion are not supported.");
+				}
+
+				// Distance from nearest read end
+				let sidedness = min(seq_idx, seq.len() - 1 - seq_idx);
+				let mut pileup = &mut pileups[pileup_idx - 1];
+
+				let mut allele = String::new();
+				allele.push('-');
+				for _ in 0..len {
+					allele.push('N');
+					pileup_idx += 1;
+				}
+
+				count_indel(&mut pileup, &allele, sidedness, read.mapq(),
+					!read.is_reverse());
+
+				// Indel read counts are stored in the pileup structure that
+				// is located immediately to the left of where the indel begins.
+				// If that base was N in this read, it was not counted towards
+				// pileup.total and so we do so here.
+				if prior_n {
+					pileup.total += 1;
+					pileup.strand += if read.is_reverse() { 0 } else { 1 };
+				}
+			},
+			Cigar::RefSkip(len) => { pileup_idx += len as usize; },
+			Cigar::SoftClip(len) => { seq_idx += len as usize; },
+			Cigar::HardClip(_) => {},
+			_ => error!("Unsupported CIGAR element")
+		}
+	}
+}
+
+
+
+
+fn count_indel(pileup: &mut Pileup, seq: &str, end_distance: usize, mapq: u8, plus_strand: bool) {
 	for i in 0..pileup.indels.len() {
-		let mut indel = &mut pileup.indels[ i];
+		let mut indel = &mut pileup.indels[i];
 		if &*indel.sequence == seq {
 			indel.reads += 1;
-
-			// Calculate running totals. Division is done later.
-			indel.sidedness += end_distance;
+			indel.sidedness += end_distance as u32;
 			indel.mapq += mapq as u32;
+			indel.strand += if plus_strand { 1 } else { 0 };
 			return;
 		}
 	}
 	pileup.indels.push(Indel {
 		sequence: seq.into(), 
 		reads: 1, 
-		sidedness: end_distance, 
-		mapq: mapq as u32
+		sidedness: end_distance as u32, 
+		mapq: mapq as u32,
+		strand: if plus_strand { 1 } else { 0 }
 	});
 }
+
 
 fn encoded_base_to_acgt_index(encoded: u8) -> usize {
 	match encoded {
@@ -590,6 +523,23 @@ fn encoded_base_to_acgt_index(encoded: u8) -> usize {
 	}
 }
 
+
 fn encoded_base_to_char(encoded: u8) -> char {
 	match encoded { 1 => 'A', 2 => 'C', 4 => 'G', 8 => 'T', _ => 'N' }
+}
+
+fn base_to_acgt_index(base: u8) -> usize {
+	match base { b'A' => 0, b'C' => 1, b'G' => 2, b'T' => 3, _ => 10 }
+}
+
+// Function for reading BAM records, with proper user-friendly messages.
+// Returns false after reading the last record, or if reading fails.
+fn read_bam_record(bam: &mut bam::Reader, record: &mut bam::Record) -> bool {
+	match bam.read(record) {
+		Ok(true) => true,
+		Ok(false) => false,
+		Err(bam::Error::TruncatedRecord) => error!("BAM file ended prematurely."),
+		Err(bam::Error::InvalidRecord) => error!("Invalid BAM record."),
+		Err(e) => error!("Failed reading BAM record: {}", e)
+	}
 }

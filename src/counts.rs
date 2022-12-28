@@ -8,7 +8,7 @@ use bio::io::fasta;
 use itertools::Itertools;
 use rayon::prelude::*;
 // use smartstring::alias::String;    // Small string optimization
-use crate::parse_args;
+use crate::common::parse_args;
 
 use std::fs::File;
 use std::io::{Write, BufRead, BufReader};
@@ -18,15 +18,17 @@ Usage:
   mutato counts [options] <genome.fa> <bam_files>...
 
 Options:
-  --min-depth=N             Minimum number of overlapping reads in a position [default: 10]
+  --min-depth=N             Minimum required depth [default: 10]
   --min-mapq=N              Minimum mapping quality [default: 20]
   --min-baseq=N             Minimum base quality [default: 0]
   --max-allele-fraction=F   Maximum variant allele fraction [default: 0.05]
+  --min-end-dist=N          Ignore N bases at both read ends [default: 0]
   --threads=N               Maximum number of threads to use [default: 4]
   --out-dir=PATH            Output path [default: ./]
-  --blacklist=FILE          .tsv file of blacklisted variants [default: none]
-  --read-strand=BOOL        Report variants from read's strand insted of original strand (mate 1) [default: false]
-  --debug=BOOL              Print variants to stdout [default: false]
+  --blacklist=FILE          TSV file of blacklisted variants [default: none]
+  --read-strand             Report substitutions with respect to read's strand
+                            rather than the ssDNA fragment's strand
+  --debug                   Print variants to stdout
 ";
 
 
@@ -39,8 +41,8 @@ impl SubstitutionMatrix {
 		let mut ref_idx = match ref_base {'A'=>0,'C'=>1,'G'=>2,'T'=>3,_=>return};
 		let mut var_idx = match var_base {'A'=>0,'C'=>1,'G'=>2,'T'=>3,_=>return};
 		if rev {
-			ref_idx = 3 - ref_idx;
-			var_idx = 3 - var_idx;
+			ref_idx = 3 - ref_idx;  // Complement
+			var_idx = 3 - var_idx;  // Complement
 		}
 		self.matrix[ref_idx][var_idx] += n;
 	}
@@ -79,30 +81,40 @@ impl Blacklist {
 	}
 }
 
+#[derive(Default)]
+pub struct Settings {
+	pub out_dir: String,
+	pub min_depth: u32,
+	pub min_mapq: u8,
+	pub min_baseq: u8,
+	pub max_allele_frac: f32,
+	pub max_threads: usize,
+	pub read_strand: bool,
+	pub min_end_distance: u8,
+	pub debug: bool
+}
+
 pub fn main() {
 	let args = parse_args(USAGE);
 	let genome_path = args.get_str("<genome.fa>");
 	let bam_paths = args.get_vec("<bam_files>");
-    let out_dir = args.get_str("--out-dir");
-    let blacklist = args.get_str("--blacklist");
-	let min_depth: u32 = args.get_str("--min-depth").parse().unwrap_or_else(
-		|_| error!("--min-depth must be a positive integer"));
-	let min_mapq: u8 = args.get_str("--min-mapq").parse().unwrap_or_else(
-		|_| error!("--min-mapq must be a positive integer"));
-	let min_baseq: u8 = args.get_str("--min-baseq").parse().unwrap_or_else(
-		|_| error!("--min-baseq must be a positive integer"));
-	let max_allele_frac: f32 = args.get_str("--max-allele-fraction").parse().unwrap_or_else(
-		|_| error!("--max-allele-fraction must be a decimal number between 0 and 1"));
-	let max_threads: usize = args.get_str("--threads").parse().unwrap_or_else(
-		|_| error!("--threads must be a positive integer."));
-	let read_strand: bool = args.get_str("--read-strand").parse().unwrap_or_else(
-		|_| error!("--read-strand must be true/false."));
-	let debug: bool = args.get_str("--debug").parse().unwrap_or_else(
-		|_| error!("--debug must be true/false."));
+	let blacklist = args.get_str("--blacklist");
 
-	if debug && bam_paths.len() > 1 {
-		eprintln!("WARNING: Variants are not ordered when running debug to multiple samples simultaneously")
-	}
+	let mut settings = Settings::default();
+	settings.out_dir = args.get_str("--out-dir").into();
+	settings.min_depth = args.get_str("--min-depth").parse().unwrap_or_else(
+		|_| error!("--min-depth must be a positive integer"));
+	settings.min_mapq = args.get_str("--min-mapq").parse().unwrap_or_else(
+		|_| error!("--min-mapq must be a positive integer"));
+	settings.min_baseq = args.get_str("--min-baseq").parse().unwrap_or_else(
+		|_| error!("--min-baseq must be a positive integer"));
+	settings.max_allele_frac = args.get_str("--max-allele-fraction").parse().unwrap_or_else(|_| error!("--max-allele-fraction must be a decimal number between 0 and 1"));
+	settings.min_end_distance = args.get_str("--min-end-dist").parse()
+		.unwrap_or_else(|_| error!("--min-end-dist must be a positive integer."));
+	settings.max_threads = args.get_str("--threads").parse().unwrap_or_else(
+		|_| error!("--threads must be a positive integer."));
+	settings.read_strand = args.get_bool("--read-strand");
+	settings.debug = args.get_bool("--debug");
 
 	eprintln!("Reading reference genome into memory...");
 	let genome_reader = fasta::Reader::from_file(&genome_path).
@@ -127,21 +139,21 @@ pub fn main() {
 	};
 
 	// Initialize the thread pool for analyzing multiple BAM files in parallel
-	rayon::ThreadPoolBuilder::new().num_threads(max_threads).build_global()
-		.unwrap();
+	rayon::ThreadPoolBuilder::new().num_threads(settings.max_threads)
+		.build_global().unwrap();
 
 	eprintln!("Analyzing BAM files:");
 	bam_paths.par_iter().for_each(|bam_path| {
-		if debug {
+		if settings.debug {
 			println!("CHR\tSTART\tSTOP\tREF\tALT\tREADS (VARIANT/TOTAL)\tVARIANT READS (PRIMARY STRAND/TOTAL)");
 		}
 		eprintln!("- {}", &bam_path);
 		let bam = bam_path.split("/").last().unwrap();
-		let (substitution_matrix, ins_counts, del_counts) = analyze_bam(&bam_path, &genome, &blacklist, min_depth, min_mapq, min_baseq, max_allele_frac, read_strand, debug);
+		let (substitution_matrix, ins_counts, del_counts) = analyze_bam(&bam_path, &genome, &blacklist, &settings);
     
 		let sample: Vec<_> = bam.split(".").collect();
 		let sample = sample[0..sample.len()-1].join("");
-		let out = &format!("{}/{}-counts.tsv", out_dir, sample);
+		let out = &format!("{}/{}-counts.tsv", &settings.out_dir, sample);
 		let mut file = File::create(out).unwrap_or_else(
 			|_| error!("Could not create file {}", out));
 		
@@ -170,8 +182,7 @@ pub fn main() {
 
 
 fn analyze_bam(bam_path: &str, genome: &HashMap<String, Vec<u8>>, 
-	blacklist: &Blacklist, min_depth: u32, min_mapq: u8, min_baseq: u8, 
-	max_allele_frac: f32, read_strand: bool, debug: bool) 
+	blacklist: &Blacklist, settings: &Settings) 
 	-> (SubstitutionMatrix, [u32; 20], [u32; 20]) {
 
 	// Open the BAM file for reading
@@ -197,7 +208,7 @@ fn analyze_bam(bam_path: &str, genome: &HashMap<String, Vec<u8>>,
 		if read.is_secondary() || read.is_supplementary() { continue; }
 		if read.is_quality_check_failed() { continue; }
 		if read.tid() < 0 { error!("Invalid TID < 0."); }
-		if read.mapq() < min_mapq { continue; }
+		if read.mapq() < settings.min_mapq { continue; }
 
 		let chr = read.tid() as u32;
 		let pos = read.pos() as u32 + 1;   // Convert to one-based coordinate
@@ -222,10 +233,10 @@ fn analyze_bam(bam_path: &str, genome: &HashMap<String, Vec<u8>>,
 				curr_chr_black += 1;
 			}
 			
-			if curr_chr_black != chr_black_pos.len() && 
-				chr_black_pos[curr_chr_black] == curr_pos ||
-				pileup.total < min_depth	{
-						curr_pos += 1;
+			if (curr_chr_black != chr_black_pos.len() && 
+				chr_black_pos[curr_chr_black] == curr_pos) ||
+				pileup.total < settings.min_depth {
+				curr_pos += 1;
 				break
 			}
 
@@ -234,17 +245,17 @@ fn analyze_bam(bam_path: &str, genome: &HashMap<String, Vec<u8>>,
 			let mut valid_allele_frac = true;
 			for base in 0..4 {
 				if ACGT[base] == ref_base { continue; };
-				if (pileup.acgt[base] / pileup.total) as f32 > max_allele_frac {
-						valid_allele_frac = false;
-						break
+				if pileup.acgt[base] as f32 / pileup.total as f32 > settings.max_allele_frac {
+					valid_allele_frac = false;
+					break
 				}
 			}
 			if valid_allele_frac {
 				for base in 0..4 {
 					if pileup.acgt[base] == 0 { continue; };
-					if debug && ACGT[base] != ref_base {
+					if settings.debug && ACGT[base] != ref_base {
 						let chr_name = chr_names[chr as usize];
-						print!("{}\t{}\t{}\t{}\t{}", &chr_name, curr_pos-1, curr_pos, &ref_base, &ACGT[base]);
+						print!("{}\t{}\t{}\t{}\t{}", bam_path, &chr_name, curr_pos-1, &ref_base, &ACGT[base]);
 						let vaf_percent: f32 = pileup.acgt[base] as f32 / pileup.total as f32 * 100.0;
 						print!("\t{}/{} ({:.3}%)", &pileup.acgt[base], &pileup.total, &vaf_percent);
 						let strand_percent = pileup.acgt_strand[base] as f32 / pileup.acgt[base] as f32 * 100.0;
@@ -254,7 +265,7 @@ fn analyze_bam(bam_path: &str, genome: &HashMap<String, Vec<u8>>,
 					substitution_matrix.add(&ref_base, &ACGT[base], pileup.acgt[base] - pileup.acgt_strand[base], true);
 				}
 			}
-			
+			/*
 			for indel in &pileup.indels {
 				if indel.sequence.len()-1 > ins_counts.len() { continue; };
 				let sign = indel.sequence.as_bytes()[0];
@@ -277,7 +288,7 @@ fn analyze_bam(bam_path: &str, genome: &HashMap<String, Vec<u8>>,
 						println!("\t\t{}/{} ({:.3}%)", &indel.strand_reads, &indel.reads, &strand_percent);
 					}
 				}
-			}
+			}*/
 			curr_pos += 1;
 		}
 
@@ -301,7 +312,7 @@ fn analyze_bam(bam_path: &str, genome: &HashMap<String, Vec<u8>>,
 
 		// At this point pileups[0] represents chromosome position "curr_pos".
 		// We add the read to the pileups vector.
-		add_read_to_pileups(&mut pileups, &read, &min_baseq, read_strand);
+		add_read_to_pileups(&mut pileups, &read, &settings);
 	}
 
 	(substitution_matrix, ins_counts, del_counts)
@@ -309,7 +320,7 @@ fn analyze_bam(bam_path: &str, genome: &HashMap<String, Vec<u8>>,
 
 
 
-fn add_read_to_pileups(pileups: &mut VecDeque<Pileup>, read: &bam::Record, min_baseq: &u8, read_strand: bool) {
+fn add_read_to_pileups(pileups: &mut VecDeque<Pileup>, read: &bam::Record, settings: &Settings) {
 	// Calculate how long the pileup vector needs to be to accommodate
 	// the information from this read.
 	let mut read_span = 0;
@@ -339,32 +350,39 @@ fn add_read_to_pileups(pileups: &mut VecDeque<Pileup>, read: &bam::Record, min_b
 	let seq = read.seq();
 	let qual = read.qual();
 
-	// seq represents the strand to be reported (mate 1 or read depending on --read-strand)
-	let primary_strand = (read_strand && !read.is_reverse()) || 
-							(!read_strand && (!read.is_paired() || read.is_first_in_template()));
+	let primary_strand = if settings.read_strand {
+		!read.is_reverse()
+	} else {
+		read.is_first_in_template() == !read.is_reverse()
+	};
 
 	for s in read.cigar().iter() {
 		match *s {
 			Cigar::Match(len) | Cigar::Equal(len) | Cigar::Diff(len) => {
 				for _ in 0..len {
-					if &qual[seq_idx] >= min_baseq {
-						let acgt_idx = match seq.encoded_base(seq_idx) {
-							1 => 0,   // A
-							2 => 1,   // C
-							4 => 2,   // G
-							8 => 3,   // T
-							_ => 4    // N
-						};
-						if acgt_idx >= 4 {
-							prior_n = true;  // Ambiguous nucleotide
-						} else {
-							prior_n = false;
-							pileups[pileup_idx].total += 1;
-							pileups[pileup_idx].acgt[acgt_idx] += 1;
-							if primary_strand {
-								pileups[pileup_idx].acgt_strand[acgt_idx] += 1;
-							};
-						};
+					let acgt_idx = match seq.encoded_base(seq_idx) {
+						1 => 0,   // A
+						2 => 1,   // C
+						4 => 2,   // G
+						8 => 3,   // T
+						_ => 4    // N
+					};
+
+					let end_distance = min(seq_idx, seq.len() - 1 - seq_idx) as u32;
+
+					if acgt_idx >= 4 {
+						prior_n = true;  // Ambiguous nucleotide
+					} else if qual[seq_idx] < settings.min_baseq {
+						prior_n = true;  // Low quality base, ignore
+					} else if end_distance < settings.min_end_distance as u32 {
+						// Too close to fragment end, do nothing
+					} else {
+						prior_n = false;
+						pileups[pileup_idx].total += 1;
+						pileups[pileup_idx].acgt[acgt_idx] += 1;
+						if primary_strand {
+							pileups[pileup_idx].acgt_strand[acgt_idx] += 1;
+						}
 					}
 					pileup_idx += 1;
 					seq_idx += 1;
@@ -390,6 +408,13 @@ fn add_read_to_pileups(pileups: &mut VecDeque<Pileup>, read: &bam::Record, min_b
 				}
 				if allele.contains('N') { continue; }  // No ambiguous
 
+				// Distance from nearest read end
+				let end_distance = min(seq_idx - (len as usize),
+					seq.len() - 1 - seq_idx) as u32;
+				if end_distance < settings.min_end_distance as u32 {
+					continue;
+				}
+
 				let pileup = &mut pileups[pileup_idx - 1];
 				count_indel(pileup, &allele, primary_strand);
 
@@ -412,6 +437,11 @@ fn add_read_to_pileups(pileups: &mut VecDeque<Pileup>, read: &bam::Record, min_b
 					pileup_idx += 1;
 				}
 
+				let end_distance = min(seq_idx, seq.len() - 1 - seq_idx) as u32;
+				if end_distance < settings.min_end_distance as u32 {
+					continue;
+				}
+
 				count_indel(&mut pileup, &allele, primary_strand);
 
 				// Indels are assigned to the coordinate of the previous
@@ -420,10 +450,9 @@ fn add_read_to_pileups(pileups: &mut VecDeque<Pileup>, read: &bam::Record, min_b
 				// added here.
 				if prior_n { pileup.total += 1; }
 			},
-            // Soft and hard clips must come last in a CIGAR string.
-			// So if we see them, we are done with the read.
-			Cigar::SoftClip(_) | Cigar::HardClip(_) => { break; },
 			Cigar::RefSkip(len) => { pileup_idx += len as usize; },
+			Cigar::SoftClip(len) => { seq_idx += len as usize; },
+			Cigar::HardClip(_) => {},
 			_ => error!("Unsupported CIGAR element")
 		}
 	}
@@ -465,9 +494,7 @@ fn count_indel(pileup: &mut Pileup, seq: &String, primary_strand: bool) {
 		let mut indel = &mut pileup.indels[i];
 		if &*indel.sequence == seq { // Why derefrence?
 			indel.reads += 1;
-			if primary_strand {
-				indel.strand_reads += 1;
-			}
+			if primary_strand { indel.strand_reads += 1; }
 			return;
 		}
 	}

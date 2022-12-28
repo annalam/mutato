@@ -97,10 +97,10 @@ impl Genome {
 		&self.chrs[index].0
 	}
 
-	pub fn sequence(&self, chr: &str) -> Option<&Vec<u8>> {
+	pub fn sequence(&self, chr: &str) -> &Vec<u8> {
 		match self.chr_map.get(chr) {
-			Some(idx) => Some(&self.chrs[*idx].1),
-			None => None
+			Some(idx) => &self.chrs[*idx].1,
+			None => error!("Chromosome {} not found in genome FASTA file.", &chr)
 		}
 	}
 
@@ -108,8 +108,9 @@ impl Genome {
 		&self.chrs[index].1
 	}
 
-	pub fn chr_idx(&self, chr: &str) -> Option<usize> {
-		self.chr_map.get(chr).map(|x| *x)
+	pub fn chr_idx(&self, chr: &str) -> usize {
+		*self.chr_map.get(chr).unwrap_or_else(||
+			error!("Chromosome {} not found in genome FASTA file.", &chr))
 	}
 }
 

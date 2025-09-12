@@ -3,32 +3,37 @@ use std::str;
 use std::collections::VecDeque;
 use rust_htslib::bam::{self, Read, record::Cigar};
 use itertools::Itertools;
+use regex::Regex;
 use rayon::prelude::*;
-use smartstring::alias::String;    // Small string optimization
-use crate::common::{parse_args, Genome};
+use compact_str::CompactString as CString;    // Small string optimization
+use crate::common::{parse_args, Genome, read_bam_record};
 
 const USAGE: &str = "
 Usage:
-  mutato call [options] <genome.fa> <bam_files>...
+  mutato call [options] <genome.fa> <sam/bam/cram>...
 
 Options:
   --alt-reads=N     Minimum alt allele reads to report [default: 5]
   --alt-frac=N      Minimum alt allele fraction to report [default: 0.1]
   --min-baseq=N     Ignore bases with a base quality < N [default: 0]
   --min-end-dist=N  Ignore N bases at both read ends [default: 0]
+  --max-clip=N      Ignore reads have > N clipped bases [default: 999999]
+  --min-depth=N     Minimum total depth [default: 0]
+  --concordant      Only count concordantly aligned read pairs
   --ffpe            Suppress formaldehyde induced artifacts (e.g. FFPE sample)
   --oxidative       Suppress oxidative damage (i.e. oxo-guanine)
+  --use-duplicates  Include duplicate reads in analysis
   --no-strand-bias  Do not report strand bias statistics
   --threads=N       Maximum number of threads to use [default: 4]
   --single-pass     Generate candidate variant list, but skip the second pass
 
-Analyzes a set of BAM samples provided by the user to identify potential
+Analyzes a set of SAM/BAM/CRAM files provided by the user to identify potential
 genomic variants. The analysis is carried out in two passes. In the first pass,
-the algorithm searches for genomic positions where at least one of the BAM
+the algorithm searches for genomic positions where at least one of the
 samples carries a non-reference allele with the number of supporting reads
 exceeding user-specified thresholds. In the second pass, the algorithm
 calculates the precise number of (non-duplicate) reads supporting each
-candidate variant in each BAM file, and outputs this information as a
+candidate variant in each SAM/BAM/CRAM file, and outputs this information as a
 tab-separated file reminiscent of the VCF format.
 
 The software also reports the following additional statistics for each
@@ -60,7 +65,7 @@ impl Substitution {
 
 #[derive(Clone)]
 struct Indel {
-	sequence: String,   // Prefixed with '+' for insertion, '-' for deletion
+	sequence: CString,   // Prefixed with '+' for insertion, '-' for deletion
 	reads: u32,
 	sidedness: u32,     // Average position from nearest read end
 	mapq: u32,
@@ -81,7 +86,7 @@ struct Pileup {
 pub struct Mutation {
 	pub chr: u16,
 	pub position: u32,
-	pub alt_allele: String
+	pub alt_allele: CString
 }
 
 #[derive(Clone)]
@@ -99,8 +104,12 @@ pub struct Settings {
 	pub alt_reads: u32,
 	pub alt_frac: f32,
 	pub min_baseq: u8,
+	pub concordant: bool,
 	pub min_end_distance: u8,
+	pub max_clip: usize,
 	pub no_strand_bias: bool,
+	pub min_depth: u32,
+	pub use_duplicates: bool,
 	pub suppress_ffpe_artifacts: bool,
 	pub suppress_oxidative_damage: bool
 }
@@ -108,7 +117,7 @@ pub struct Settings {
 pub fn main() {
 	let args = parse_args(USAGE);
 	let genome_path = args.get_str("<genome.fa>");
-	let bam_paths = args.get_vec("<bam_files>");
+	let bam_paths = args.get_vec("<sam/bam/cram>");
 	let max_threads: usize = args.get_str("--threads").parse().unwrap_or_else(
 		|_| error!("--threads must be a positive integer."));
 	let single_pass = args.get_bool("--single-pass");
@@ -122,7 +131,13 @@ pub fn main() {
 		|_| error!("--min-baseq must be a non-negative integer."));
 	settings.min_end_distance = args.get_str("--min-end-dist").parse()
 		.unwrap_or_else(|_| error!("--min-end-dist must be a non-negative integer."));
+	settings.max_clip = args.get_str("--max-clip").parse().
+		unwrap_or_else(|_| error!("--max-clip must be a non-negative number."));
+	settings.min_depth = args.get_str("--min-depth").parse()
+		.unwrap_or_else(|_| error!("--min-depth must be a non-negative integer."));
 	
+	settings.concordant = args.get_bool("--concordant");
+	settings.use_duplicates = args.get_bool("--use-duplicates");
 	settings.no_strand_bias = args.get_bool("--no-strand-bias");
 	settings.suppress_ffpe_artifacts = args.get_bool("--ffpe");
 	settings.suppress_oxidative_damage = args.get_bool("--oxidative");
@@ -134,8 +149,8 @@ pub fn main() {
 	rayon::ThreadPoolBuilder::new().num_threads(max_threads).build_global()
 		.unwrap();
 
-	eprintln!("Analyzing BAM files for candidate variants:");
-	let mut sample_variants: Vec<_> = bam_paths.par_iter().map(|&bam_path| {
+	eprintln!("Analyzing samples for candidate variants:");
+	let sample_variants: Vec<_> = bam_paths.par_iter().map(|&bam_path| {
 		eprintln!("- {}", &bam_path);
 		let mut variants = analyze_bam_firstpass(&bam_path, &genome, &settings);
 		variants.sort();  // Sort in preparation for k-way merge
@@ -155,8 +170,9 @@ pub fn main() {
 	}).collect();
 	
 	print!("CHROM\tPOSITION\tREF\tALT\tNOTES");
+	let sam_rx = Regex::new(r"\.(bam|cram|sam|BAM|CRAM|SAM)").unwrap();
 	for bam_path in &bam_paths {
-		print!("\t{}", bam_path.trim_end_matches(".bam"));
+		print!("\t{}", sam_rx.replace(bam_path, ""));
 	}
 	println!();
 	for k in 0..variants.len() {
@@ -214,10 +230,13 @@ fn analyze_bam_firstpass(bam_path: &str, genome: &Genome, settings: &Settings) -
 
 	let mut read = bam::Record::new();
 	while read_bam_record(&mut bam, &mut read) {
-		if read.is_unmapped() || read.is_duplicate() { continue; }
+		if read.is_unmapped() { continue; }
+		if settings.use_duplicates == false && read.is_duplicate() { continue; }
 		if read.is_secondary() || read.is_supplementary() { continue; }
 		if read.is_quality_check_failed() { continue; }
-		if read.tid() < 0 { error!("Invalid TID < 0."); }
+		if settings.concordant && read.is_paired() {
+			if read.tid() != read.mtid() { continue; }
+		}
 
 		let chr = read.tid() as u32;
 		let pos = read.pos() as u32 + 1;   // Convert to one-based coordinate
@@ -246,6 +265,7 @@ fn analyze_bam_firstpass(bam_path: &str, genome: &Genome, settings: &Settings) -
 				if reads < settings.alt_reads || (reads as f32) / (pileup.total as f32) < settings.alt_frac {
 					continue;
 				}
+				if pileup.total < settings.min_depth { continue; }
 				mutations.push(Mutation { chr: chr_idx, position: curr_pos,
 					alt_allele: str::from_utf8(&[ACGT[base]]).unwrap().into() });
 			}
@@ -255,7 +275,7 @@ fn analyze_bam_firstpass(bam_path: &str, genome: &Genome, settings: &Settings) -
 					(pileup.total as f32) < settings.alt_frac {
 					continue;
 				}
-				let sign = indel.sequence.as_bytes()[0];
+				//let sign = indel.sequence.as_bytes()[0];
 				mutations.push(Mutation { chr: chr_idx, position: curr_pos,
 					alt_allele: indel.sequence.into() });
 			}
@@ -295,16 +315,19 @@ pub fn analyze_bam_secondpass(bam_path: &str, genome: &Genome, mutations: &Vec<M
 	let mut pileups: VecDeque<Pileup> = VecDeque::with_capacity(1000);
 	let mut curr_chr: u32 = u32::MAX;
 	let mut curr_pos: u32 = 0;
-	let mut chr_seq = genome.sequence_by_chr_idx(0);
+	//let mut chr_seq = genome.sequence_by_chr_idx(0);
 	let mut chr_muts: VecDeque<usize> = VecDeque::new();
 	let mut evidence = vec![Evidence { alt_reads: 0, total_reads: 0, mapq: 0, sidedness: 0, strand: 0, other_strand: 0 }; mutations.len()];
 
 	let mut read = bam::Record::new();
 	while read_bam_record(&mut bam, &mut read) {
-		if read.is_unmapped() || read.is_duplicate() { continue; }
+		if read.is_unmapped() { continue; }
+		if settings.use_duplicates == false && read.is_duplicate() { continue; }
 		if read.is_secondary() || read.is_supplementary() { continue; }
 		if read.is_quality_check_failed() { continue; }
-		if read.tid() < 0 { error!("Invalid TID < 0."); }
+		if settings.concordant && read.is_paired() {
+			if read.tid() != read.mtid() { continue; }
+		}
 
 		let chr = read.tid() as u32;
 		let pos = read.pos() as u32 + 1;   // Convert to 1-based coordinate
@@ -351,7 +374,7 @@ pub fn analyze_bam_secondpass(bam_path: &str, genome: &Genome, mutations: &Vec<M
 			inside.sort_by_key(|&m| mutations[m].position);
 			chr_muts = inside.into();   // Convert from Vec to VecDeque
 
-			chr_seq = genome.sequence_by_chr_idx(chr_indices[chr as usize] as usize);
+			//chr_seq = genome.sequence_by_chr_idx(chr_indices[chr as usize] as usize);
 		}
 
 		// It is critical that these are updated only *after* reporting
@@ -373,16 +396,22 @@ fn add_read_to_pileups(pileups: &mut VecDeque<Pileup>, read: &bam::Record, setti
 	// Calculate how long the pileup vector needs to be to accommodate
 	// the information from this read.
 	let mut read_span = 0;
+	let mut total_clip = 0;
 	for s in read.cigar().iter() {
 		match *s {
 			Cigar::Match(len) | Cigar::Equal(len) | Cigar::Diff(len) |
 			Cigar::Del(len) | Cigar::RefSkip(len) => {
 				read_span += len as usize;
 			},
-			Cigar::Ins(_) | Cigar::SoftClip(_) | Cigar::HardClip(_) => {},
+			Cigar::Ins(_) => {},
+			Cigar::SoftClip(len) | Cigar::HardClip(len) => {
+				total_clip += len as usize;
+			},
 			_ => error!("Unsupported CIGAR element found.")
 		}
 	}
+
+	if total_clip > settings.max_clip { return }
 
 	// Extend the pileup vector if necessary.
 	while pileups.len() < read_span {
@@ -417,8 +446,8 @@ fn add_read_to_pileups(pileups: &mut VecDeque<Pileup>, read: &bam::Record, setti
 					} else if qual[seq_idx] < settings.min_baseq {
 						prior_n = true;    // Low quality base, ignore
 					} else {
-						let mut pileup = &mut pileups[pileup_idx];
-						let mut sub = &mut pileup.acgt[acgt_idx];
+						let pileup = &mut pileups[pileup_idx];
+						let sub = &mut pileup.acgt[acgt_idx];
 
 						prior_n = false;
 
@@ -521,7 +550,7 @@ fn add_read_to_pileups(pileups: &mut VecDeque<Pileup>, read: &bam::Record, setti
 
 fn count_indel(pileup: &mut Pileup, seq: &str, end_distance: u32, mapq: u8, plus_read_strand: bool, plus_phys_strand: bool) {
 	for i in 0..pileup.indels.len() {
-		let mut indel = &mut pileup.indels[i];
+		let indel = &mut pileup.indels[i];
 		if &*indel.sequence == seq {
 			indel.reads += 1;
 			indel.sidedness += end_distance;
@@ -603,10 +632,6 @@ fn calculate_mutation_evidence(mutation: &Mutation, pileup: &Pileup,
 }
 
 
-
-
-
-
 fn encoded_base_to_acgt_index(encoded: u8) -> usize {
 	match encoded {
 		1 => 0,   // A
@@ -626,14 +651,3 @@ fn base_to_acgt_index(base: u8) -> usize {
 	match base { b'A' => 0, b'C' => 1, b'G' => 2, b'T' => 3, _ => 10 }
 }
 
-// Function for reading BAM records, with proper user-friendly messages.
-// Returns false after reading the last record, or if reading fails.
-fn read_bam_record(bam: &mut bam::Reader, record: &mut bam::Record) -> bool {
-	match bam.read(record) {
-		Ok(true) => true,
-		Ok(false) => false,
-		Err(bam::Error::TruncatedRecord) => error!("BAM file ended prematurely."),
-		Err(bam::Error::InvalidRecord) => error!("Invalid BAM record."),
-		Err(e) => error!("Failed reading BAM record: {}", e)
-	}
-}

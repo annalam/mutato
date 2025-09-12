@@ -1,6 +1,6 @@
 use std::str;
 use rayon::prelude::*;
-use crate::common::{parse_args, Genome, FileReader};
+use crate::common::{parse_args, Genome, TsvReader};
 use crate::call::{Mutation, Settings, analyze_bam_secondpass};
 
 const USAGE: &str = "
@@ -11,6 +11,8 @@ Options:
   --min-baseq=N     Ignore bases with a base quality < N [default: 0]
   --min-end-dist=N  Ignore N bases at both read ends [default: 0]
   --no-strand-bias  Do not report strand bias statistics
+  --concordant      Only count concordantly aligned read pairs
+  --use-duplicates  Include duplicate reads in analysis
   --threads=N       Maximum number of threads to use [default: 4]
 
 Calculates the number of supporting reads for a list of genomic variants,
@@ -37,6 +39,8 @@ pub fn main() {
 		|_| error!("--min-baseq must be a non-negative integer."));
 	settings.min_end_distance = args.get_str("--min-end-dist").parse()
 		.unwrap_or_else(|_| error!("--min-end-dist must be a non-negative integer."));
+	settings.concordant = args.get_bool("--concordant");
+	settings.use_duplicates = args.get_bool("--use-duplicates");
 	settings.no_strand_bias = args.get_bool("--no-strand-bias");
 
 	eprintln!("Reading reference genome into memory...");
@@ -47,37 +51,36 @@ pub fn main() {
 		.unwrap();
 
 	eprintln!("Reading the variant list into memory...");
-	let mut variants_tsv = FileReader::new(&variants_path);
+	let tsv = TsvReader::new(&variants_path);
 	let mut variants: Vec<Mutation> = Vec::new();
 
-	let mut line = String::new();
-	while variants_tsv.read_line(&mut line) {
-		if line.starts_with('#') { continue; }
-		let cols: Vec<&str> = line.trim_end().split('\t').collect();
-		if cols.len() < 4 { continue; }
-		let chr = genome.chr_idx(&cols[0]);
-		let position: u32 = cols[1].parse().unwrap_or_else(|_|
-			error!("Variant position '{}' is invalid:\n{}", &cols[1], &line));
+	for row in tsv {
+		if row[0].starts_with('#') || row[0].starts_with("CHROM") { continue; }
+		if row.len() < 4 { continue; }
+		let chr = genome.chr_idx(&row[0]);
+		let position: u32 = row[1].parse().unwrap_or_else(|_|
+			error!("Variant position '{}' is invalid:\n", &row[1]));
 
 		// We need to convert the alternate allele into the internal
 		// representation used by Mutato.
 		variants.push(Mutation { chr: chr as u16, position, alt_allele:
-			if cols[3].len() == 1 && cols[2].len() == 1 {
-				cols[3].into()
-			} else if cols[3].len() > 1 && cols[2].len() == 1 {
-				format!("+{}", &cols[3][1..]).into()
-			} else if cols[2].len() > 1 && cols[3].len() == 1 {
+			if row[3].len() == 1 && row[2].len() == 1 {
+				row[3].clone().into()
+			} else if row[3].len() > 1 && row[2].len() == 1 {
+				format!("+{}", &row[3][1..]).into()
+			} else if row[2].len() > 1 && row[3].len() == 1 {
 				let mut del: String = "-".into();
-				for k in 1..cols[2].len() { del.push('N'); }
+				for _ in 1..row[2].len() { del.push('N'); }
 				del.into()
 			} else {
-				eprintln!("ERROR: '{}' > '{}'", &cols[2], &cols[3]);
+				eprintln!("ERROR: '{}' > '{}'", &row[2], &row[3]);
 				unreachable!()
 			}
 		});
 	}
 
 	eprintln!("Calculating evidence matrix for {} variants...", variants.len());
+	eprintln!("Anticipated memory use is {:.1} GB.", (variants.len() * bam_paths.len() * 12) as f64 / 1e9 + 3.0);
 	let evidence: Vec<_> = bam_paths.par_iter().map(|&bam_path| {
 		analyze_bam_secondpass(&bam_path, &genome, &variants, &settings)
 	}).collect();

@@ -1,10 +1,13 @@
 
 use std::io::{BufRead, BufReader, stdin};
-use std::fs::File;
+use std::fs::{self, File};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::time::SystemTime;
 use bio::io::fasta;
+use rust_htslib::{bam, bam::Read, errors::Error};
 use docopt::{Docopt, ArgvMap};
 
 macro_rules! error {
@@ -14,12 +17,36 @@ macro_rules! error {
 	})
 }
 
-pub struct FileReader {
-	bufread: Box<dyn BufRead>
+pub fn is_file(path: &str) -> bool { Path::new(&path).is_file() }
+pub fn is_dir(path: &str) -> bool { Path::new(&path).is_dir() }
+pub fn file_stem(path: &str) -> String {
+	Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or("").into()
+}
+pub fn last_modified(path: &str) -> SystemTime {
+	let Ok(metadata) = fs::metadata(path) else {
+		error!("Cannot get modification date for '{}'.", path)
+	};
+	let Ok(mtime) = metadata.modified() else {
+		error!("Cannot get modification date for '{}'.", path)
+	};
+	mtime
 }
 
-impl FileReader {
-	pub fn new(path: &str) -> FileReader {
+pub fn read_dir(path: &str) -> Vec<String> {
+	let mut entries: Vec<_> = fs::read_dir(path).unwrap_or_else(|_|
+		error!("Cannot access contents of directory '{}'.", path))
+		.map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+	entries.sort();
+	entries
+}
+
+pub struct TsvReader {
+	bufread: Box<dyn BufRead>,
+	line: std::string::String
+}
+
+impl TsvReader {
+	pub fn new(path: &str) -> TsvReader {
 		let bufread: Box<dyn BufRead> = if path == "-" {
 			Box::new(BufReader::new(stdin()))
 		} else {
@@ -34,16 +61,23 @@ impl FileReader {
 				Box::new(BufReader::new(file))
 			}
 		};
-		FileReader { bufread }
+		TsvReader { bufread, line: std::string::String::new() }
 	}
 
-	pub fn read_line(&mut self, line: &mut String) -> bool {
-		line.clear();
-		match self.bufread.read_line(line) {
-			Ok(len) => len > 0,
+	pub fn read(&mut self) -> Option<Vec<String>> {
+		self.line.clear();
+		match self.bufread.read_line(&mut self.line) {
+			Ok(len) => if len == 0 { None } else {
+				Some(self.line.trim_end().split('\t').map(|s| s.into()).collect())
+			},
 			_ => { error!("I/O error while reading from file."); }
 		}
 	}
+}
+
+impl Iterator for TsvReader {
+	type Item = Vec<String>;
+	fn next(&mut self) -> Option<Self::Item> { self.read() }
 }
 
 fn chr_num(name: &str) -> u8 {
@@ -110,7 +144,19 @@ impl Genome {
 
 	pub fn chr_idx(&self, chr: &str) -> usize {
 		*self.chr_map.get(chr).unwrap_or_else(||
-			error!("Chromosome {} not found in genome FASTA file.", &chr))
+			error!("Chromosome {} not found in genome FASTA file.", chr))
+	}
+}
+
+// Function for reading BAM records, with proper user-friendly messages.
+// Returns false after reading the last record, or if reading fails.
+pub fn read_bam_record(bam: &mut bam::Reader, record: &mut bam::Record) -> bool {
+	match bam.read(record) {
+		Some(Ok(_)) => true,
+		None => false,
+		Some(Err(Error::BamTruncatedRecord)) => error!("BAM file ended prematurely."),
+		Some(Err(Error::BamInvalidRecord)) => error!("Invalid BAM record."),
+		Some(Err(e)) => error!("Failed reading BAM record: {}", e)
 	}
 }
 

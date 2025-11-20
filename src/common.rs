@@ -1,5 +1,5 @@
 
-use std::io::{BufRead, BufReader, stdin};
+use std::io::{BufRead, BufReader, BufWriter, Write, stdin};
 use std::fs::{self, File};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -31,6 +31,7 @@ pub fn last_modified(path: &str) -> SystemTime {
 	};
 	mtime
 }
+pub fn is_valid_bam(path: &str) -> bool { bam::Reader::from_path(&path).is_ok()}
 
 pub fn read_dir(path: &str) -> Vec<String> {
 	let mut entries: Vec<_> = fs::read_dir(path).unwrap_or_else(|_|
@@ -73,6 +74,16 @@ impl TsvReader {
 			_ => { error!("I/O error while reading from file."); }
 		}
 	}
+
+	pub fn read_line(&mut self) -> Option<String> {
+		self.line.clear();
+		match self.bufread.read_line(&mut self.line) {
+			Ok(len) => if len == 0 { None } else {
+				Some(self.line.trim_end().into())
+			},
+			_ => { error!("I/O error while reading from file."); }
+		}
+	}
 }
 
 impl Iterator for TsvReader {
@@ -103,6 +114,24 @@ pub fn chr_order(a: &str, b: &str) -> Ordering {
 		// If one or both chromosomes are numbered, sort by chromosome number.
 		a_num.cmp(&b_num)
 	}
+}
+
+pub struct FileWriter {
+	out: BufWriter<File>
+}
+
+impl FileWriter {
+	pub fn new(path: &str) -> FileWriter {
+		let file = File::create(path).unwrap_or_else(
+			|_| error!("Cannot open file {} for writing.", path));
+		FileWriter { out: BufWriter::new(file) }
+	}
+}
+
+impl Write for FileWriter {
+	fn write(&mut self, buf: &[u8]) -> std::io::Result<usize>
+		{ self.out.write(buf) }
+	fn flush(&mut self) -> std::io::Result<()> { self.out.flush() }
 }
 
 
